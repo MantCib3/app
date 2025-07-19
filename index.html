@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ConnectSphere Solo</title>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v2.9.1/mapbox-gl.css" rel="stylesheet">
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -76,7 +77,8 @@
     <!-- Scan Section -->
     <div class="scan-section" id="scanSection">
       <button id="scanBluetoothButton" disabled>Scanning Bluetooth Devices...</button>
-      <p class="note">Note: Wi-Fi scanning requires a local Node.js script. Run the script (wifi-scan.js) on your device and connect via WebSocket (ws://localhost:8080).</p>
+      <button id="retryGeolocationButton" style="display: none;">Retry Geolocation</button>
+      <p class="note">Note: Wi-Fi scanning requires a local Node.js script. Run 'node wifi-scan.js' on a device or server and update the WebSocket URL.</p>
     </div>
 
     <!-- Results Section -->
@@ -96,30 +98,47 @@
   <script src="https://api.mapbox.com/mapbox-gl-js/v2.9.1/mapbox-gl.js"></script>
   <script>
     // Mapbox access token
-    mapboxgl.accessToken = 'pk.eyJ1IjoieG9yc29sdXRpb25zIiwiYSI6ImNsc3Vjd3o2djA5anEycG1ueW1yNDdkeGUifQ.7h1T3yZ3i8Z3Z3Z3Z3Z3Z3';
+    mapboxgl.accessToken = 'YOUR_MAPBOX_ACCESS_TOKEN'; // Replace with your Mapbox token
 
     // Device list storage (in-memory, cleared on refresh)
     let devices = [];
 
     // Initialize Mapbox map
     let map;
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        const { latitude, longitude } = position.coords;
-        map = new mapboxgl.Map({
-          container: 'map',
-          style: 'mapbox://styles/mapbox/streets-v11',
-          center: [longitude, latitude],
-          zoom: 15,
-        });
-        // Add user location marker
+    function initMap(latitude = 0, longitude = 0, zoom = 2, showMarker = false) {
+      map = new mapboxgl.Map({
+        container: 'map',
+        style: 'mapbox://styles/mapbox/streets-v11',
+        center: [longitude, latitude],
+        zoom: zoom,
+      });
+      if (showMarker) {
         new mapboxgl.Marker().setLngLat([longitude, latitude]).addTo(map);
-      },
-      (error) => {
-        console.error('Geolocation error:', error);
-        document.getElementById('errorMessage').textContent = 'Geolocation access denied. Map disabled.';
       }
-    );
+    }
+
+    function tryGeolocation() {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const { latitude, longitude } = position.coords;
+          initMap(latitude, longitude, 15, true);
+          document.getElementById('retryGeolocationButton').style.display = 'none';
+          document.getElementById('errorMessage').textContent = '';
+        },
+        (error) => {
+          console.error('Geolocation error:', error);
+          initMap(); // Fallback to default coordinates
+          document.getElementById('errorMessage').textContent = 'Geolocation access denied. Map centered at default location. Click "Retry Geolocation" to try again.';
+          document.getElementById('retryGeolocationButton').style.display = 'block';
+        }
+      );
+    }
+
+    // Initial geolocation attempt
+    tryGeolocation();
+
+    // Retry geolocation on button click
+    document.getElementById('retryGeolocationButton').addEventListener('click', tryGeolocation);
 
     // Bluetooth scanning function
     async function scanBluetooth() {
@@ -129,7 +148,7 @@
       try {
         const device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: ['battery_service'], // Example service
+          optionalServices: ['battery_service'],
         });
 
         const deviceInfo = {
@@ -138,7 +157,6 @@
           timestamp: new Date().toLocaleTimeString(),
         };
 
-        // Add to device list (avoid duplicates)
         if (!devices.some(d => d.id === deviceInfo.id)) {
           devices.push(deviceInfo);
           updateDeviceList();
@@ -157,7 +175,7 @@
       if ('bluetooth' in navigator) {
         scanBluetooth();
       } else {
-        document.getElementById('errorMessage').textContent = 'Web Bluetooth API not supported in this browser. Use Chrome, Edge, or Opera.';
+        document.getElementById('errorMessage').textContent = 'Web Bluetooth API not supported. Use Chrome or Edge on your phone.';
         document.getElementById('scanBluetoothButton').disabled = true;
         document.getElementById('scanBluetoothButton').textContent = 'Bluetooth Not Supported';
       }
@@ -177,48 +195,77 @@
       });
     }
 
-    // Add device to map (approximate position based on signal strength)
+    // Add device to map (approximate position)
     function addDeviceToMap(device) {
       if (!map) return;
 
       navigator.geolocation.getCurrentPosition(
         (position) => {
           const { longitude, latitude } = position.coords;
-          // Approximate device position (random offset for demo, as RSSI not reliably available)
-          const offset = (Math.random() - 0.5) * 0.001; // ~100m radius
+          const offset = (Math.random() - 0.5) * 0.001;
           new mapboxgl.Marker({ color: '#007bff' })
             .setLngLat([longitude + offset, latitude + offset])
+            .setPopup(new mapboxgl.Popup().setText(device.name))
+            .addTo(map);
+        },
+        () => {
+          const offset = (Math.random() - 0.5) * 0.001;
+          new mapboxgl.Marker({ color: '#007bff' })
+            .setLngLat([offset, offset])
             .setPopup(new mapboxgl.Popup().setText(device.name))
             .addTo(map);
         }
       );
     }
 
-    // WebSocket for Wi-Fi scanning (connect to local Node.js script)
+    // WebSocket for Wi-Fi scanning with retry logic
     let ws;
-    try {
-      ws = new WebSocket('ws://localhost:8080');
-      ws.onmessage = (event) => {
-        const wifiData = JSON.parse(event.data);
-        wifiData.forEach(network => {
-          const deviceInfo = {
-            name: network.ssid || 'Unknown Wi-Fi',
-            id: network.mac || `wifi-${Date.now()}`,
-            timestamp: new Date().toLocaleTimeString(),
-          };
-          if (!devices.some(d => d.id === deviceInfo.id)) {
-            devices.push(deviceInfo);
-            updateDeviceList();
-            addDeviceToMap(deviceInfo);
+    let wifiErrorDisplayed = false;
+    let wifiRetryCount = 0;
+    function connectWebSocket() {
+      try {
+        ws = new WebSocket('ws://localhost:8080'); // Update to your server if hosted remotely
+        ws.onmessage = (event) => {
+          wifiErrorDisplayed = false;
+          wifiRetryCount = 0;
+          document.getElementById('errorMessage').textContent = '';
+          const wifiData = JSON.parse(event.data);
+          wifiData.forEach(network => {
+            const deviceInfo = {
+              name: network.ssid || 'Unknown Wi-Fi',
+              id: network.mac || `wifi-${Date.now()}`,
+              timestamp: new Date().toLocaleTimeString(),
+            };
+            if (!devices.some(d => d.id === deviceInfo.id)) {
+              devices.push(deviceInfo);
+              updateDeviceList();
+              addDeviceToMap(deviceInfo);
+            }
+          });
+        };
+        ws.onerror = () => {
+          wifiRetryCount++;
+          if (!wifiErrorDisplayed && wifiRetryCount > 3) {
+            wifiErrorDisplayed = true;
+            document.getElementById('errorMessage').textContent = 'Wi-Fi scanning unavailable. Run "node wifi-scan.js" on a device or server.';
           }
-        });
-      };
-      ws.onerror = () => {
-        document.getElementById('errorMessage').textContent = 'Wi-Fi scanning unavailable. Run the local Node.js script (wifi-scan.js).';
-      };
-    } catch (error) {
-      document.getElementById('errorMessage').textContent = 'Wi-Fi scanning unavailable. Run the local Node.js script (wifi-scan.js).';
+          setTimeout(connectWebSocket, 5000);
+        };
+        ws.onclose = () => {
+          setTimeout(connectWebSocket, 5000);
+        };
+      } catch (error) {
+        wifiRetryCount++;
+        if (!wifiErrorDisplayed && wifiRetryCount > 3) {
+          wifiErrorDisplayed = true;
+          document.getElementById('errorMessage').textContent = 'Wi-Fi scanning unavailable. Run "node wifi-scan.js" on a device or server.';
+        }
+        setTimeout(connectWebSocket, 5000);
+      }
     }
+
+    // Start WebSocket connection
+    connectWebSocket();
   </script>
 </body>
 </html>
