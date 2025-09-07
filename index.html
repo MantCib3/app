@@ -104,6 +104,51 @@
     // Device list storage (in-memory, cleared on refresh)
     let devices = [];
 
+    // Parse manufacturer-specific data
+    function parseManufacturerData(manufacturerData) {
+      if (!manufacturerData) return 'N/A';
+      
+      const data = new DataView(manufacturerData);
+      const manufacturerId = data.getUint16(0, true);
+      
+      // Known manufacturer IDs
+      const manufacturers = {
+        0x004C: 'Apple',
+        0x0006: 'Microsoft',
+        0x0075: 'Samsung',
+        0x0059: 'Nordic Semiconductor'
+      };
+      
+      return {
+        manufacturer: manufacturers[manufacturerId] || `Unknown (0x${manufacturerId.toString(16)})`,
+        rawData: Array.from(new Uint8Array(manufacturerData)).map(b => b.toString(16).padStart(2, '0')).join('')
+      };
+    }
+
+    // Check for common BLE vulnerabilities
+    function checkVulnerabilities(device, services) {
+      const vulnerabilities = [];
+      
+      // Check for weak security
+      if (device.gatt && (!device.gatt.security || device.gatt.security === 'low')) {
+        vulnerabilities.push('Weak or no security level');
+      }
+
+      // Check for sensitive services with no encryption
+      services.forEach(service => {
+        if (service.isPrimary && !service.secure) {
+          vulnerabilities.push(`Unencrypted sensitive service: ${service.uuid}`);
+        }
+      });
+
+      // Check for common misconfigurations
+      if (!device.name) {
+        vulnerabilities.push('Device name broadcasting disabled - potential hidden device');
+      }
+
+      return vulnerabilities;
+    }
+
     // Initialize Mapbox map
     let map;
     function initMap(latitude = 0, longitude = 0, zoom = 2, showMarker = false) {
@@ -150,9 +195,30 @@
       try {
         const device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: ['device_information', 'battery_service', 'generic_access'],
+          optionalServices: [
+            'device_information',
+            'battery_service',
+            'generic_access',
+            'heart_rate',
+            'health_thermometer',
+            'human_interface_device',
+            'immediate_alert',
+            'link_loss',
+            'location_and_navigation',
+            'phone_alert_status',
+            'reference_time_update',
+            'running_speed_and_cadence',
+            'scan_parameters',
+            'tx_power',
+            'user_data',
+            'weight_scale'
+          ],
         });
 
+        // Store RSSI and device class if available
+        const deviceClass = device.deviceClass || 'Unknown';
+        const rssi = device.adData ? device.adData.rssi : 'N/A';
+        
         // Connect to the device to retrieve more information
         const server = await device.gatt.connect();
         const services = await server.getPrimaryServices();
@@ -162,7 +228,13 @@
           id: device.id,
           type: 'Bluetooth',
           timestamp: new Date().toLocaleTimeString(),
+          deviceClass: deviceClass,
+          rssi: rssi,
           services: [],
+          securityLevel: server.security || 'Unknown',
+          connectionState: device.gatt.connected ? 'Connected' : 'Disconnected',
+          manufacturerData: device.adData ? parseManufacturerData(device.adData.manufacturerData) : 'N/A',
+          vulnerabilities: [],
         };
 
         // Retrieve details from each service
@@ -268,9 +340,29 @@
       deviceList.innerHTML = '';
       devices.forEach(device => {
         const li = document.createElement('li');
-        let details = `${device.name} (${device.type}, Detected at ${device.timestamp})`;
+        li.style.backgroundColor = device.vulnerabilities.length > 0 ? '#fff3f3' : 'transparent';
+        
+        let details = `
+          <strong>${device.name}</strong><br>
+          Type: ${device.type}<br>
+          Detected: ${device.timestamp}<br>
+          Device Class: ${device.deviceClass}<br>
+          RSSI: ${device.rssi} dBm<br>
+          Security Level: ${device.securityLevel}<br>
+          Connection State: ${device.connectionState}<br>
+          Manufacturer: ${typeof device.manufacturerData === 'object' ? device.manufacturerData.manufacturer : device.manufacturerData}
+        `;
+        
+        if (device.vulnerabilities && device.vulnerabilities.length > 0) {
+          details += '<div style="color: red"><strong>Vulnerabilities Found:</strong><ul>';
+          device.vulnerabilities.forEach(vuln => {
+            details += `<li>${vuln}</li>`;
+          });
+          details += '</ul></div>';
+        }
+        
         if (device.services && device.services.length > 0) {
-          details += '<ul>';
+          details += '<strong>Services:</strong><ul>';
           device.services.forEach(service => {
             details += `<li>Service: ${service.uuid}`;
             if (service.characteristics.length > 0) {
