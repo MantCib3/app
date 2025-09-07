@@ -77,8 +77,9 @@
     <!-- Scan Section -->
     <div class="scan-section" id="scanSection">
       <button id="scanBluetoothButton" disabled>Scanning Bluetooth Devices...</button>
+      <button id="scanNFCButton" style="display: none;">Scan NFC Devices</button>
       <button id="retryGeolocationButton" style="display: none;">Retry Geolocation</button>
-      <p class="note">Note: Wi-Fi scanning requires a local Node.js script. Run 'node wifi-scan.js' on a device or server and update the WebSocket URL.</p>
+      <p class="note">Note: Bluetooth scanning requires Chrome or Edge with Bluetooth enabled. NFC scanning requires Chrome on Android with NFC enabled. Wi-Fi scanning is not supported in browsers.</p>
     </div>
 
     <!-- Results Section -->
@@ -97,8 +98,8 @@
 
   <script src="https://api.mapbox.com/mapbox-gl-js/v2.9.1/mapbox-gl.js"></script>
   <script>
-    // Mapbox access token
-    mapboxgl.accessToken = 'YOUR_MAPBOX_ACCESS_TOKEN'; // Replace with your Mapbox token
+    // Mapbox access token (replace with your own token from https://mapbox.com)
+    mapboxgl.accessToken = 'YOUR_MAPBOX_ACCESS_TOKEN';
 
     // Device list storage (in-memory, cleared on refresh)
     let devices = [];
@@ -130,7 +131,8 @@
           initMap(); // Fallback to default coordinates
           document.getElementById('errorMessage').textContent = 'Geolocation access denied. Map centered at default location. Click "Retry Geolocation" to try again.';
           document.getElementById('retryGeolocationButton').style.display = 'block';
-        }
+        },
+        { timeout: 10000 } // 10-second timeout
       );
     }
 
@@ -148,14 +150,49 @@
       try {
         const device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: ['battery_service'],
+          optionalServices: ['device_information', 'battery_service', 'generic_access'],
         });
+
+        // Connect to the device to retrieve more information
+        const server = await device.gatt.connect();
+        const services = await server.getPrimaryServices();
 
         const deviceInfo = {
           name: device.name || 'Unknown Device',
           id: device.id,
+          type: 'Bluetooth',
           timestamp: new Date().toLocaleTimeString(),
+          services: [],
         };
+
+        // Retrieve details from each service
+        for (const service of services) {
+          const characteristics = await service.getCharacteristics();
+          const serviceData = {
+            uuid: service.uuid,
+            characteristics: [],
+          };
+
+          for (const characteristic of characteristics) {
+            try {
+              const value = await characteristic.readValue();
+              const decoder = new TextDecoder('utf-8');
+              serviceData.characteristics.push({
+                uuid: characteristic.uuid,
+                value: decoder.decode(value) || 'N/A',
+              });
+            } catch (err) {
+              serviceData.characteristics.push({
+                uuid: characteristic.uuid,
+                value: 'Error reading value',
+              });
+            }
+          }
+          deviceInfo.services.push(serviceData);
+        }
+
+        // Disconnect after retrieving data
+        server.disconnect();
 
         if (!devices.some(d => d.id === deviceInfo.id)) {
           devices.push(deviceInfo);
@@ -170,18 +207,59 @@
       }
     }
 
-    // Start scanning automatically on page load
+    // NFC scanning function (if supported)
+    async function scanNFC() {
+      document.getElementById('scanNFCButton').disabled = true;
+      document.getElementById('errorMessage').textContent = '';
+
+      try {
+        const ndef = new NDEFReader();
+        await ndef.scan();
+        ndef.onreading = ({ message, serialNumber }) => {
+          const deviceInfo = {
+            name: 'NFC Device',
+            id: serialNumber || `nfc-${Date.now()}`,
+            type: 'NFC',
+            timestamp: new Date().toLocaleTimeString(),
+            records: message.records.map(record => ({
+              recordType: record.recordType,
+              data: record.data ? new TextDecoder().decode(record.data) : 'N/A',
+            })),
+          };
+
+          if (!devices.some(d => d.id === deviceInfo.id)) {
+            devices.push(deviceInfo);
+            updateDeviceList();
+            addDeviceToMap(deviceInfo);
+          }
+        };
+      } catch (error) {
+        document.getElementById('errorMessage').textContent = 'NFC scan failed: ' + error.message;
+      } finally {
+        document.getElementById('scanNFCButton').disabled = false;
+        document.getElementById('scanNFCButton').textContent = 'Scan NFC Devices Again';
+      }
+    }
+
+    // Initialize scanning based on browser support
     window.addEventListener('load', () => {
+      // Bluetooth scanning
       if ('bluetooth' in navigator) {
         scanBluetooth();
       } else {
-        document.getElementById('errorMessage').textContent = 'Web Bluetooth API not supported. Use Chrome or Edge on your phone.';
+        document.getElementById('errorMessage').textContent = 'Web Bluetooth API not supported. Use Chrome or Edge on a desktop or mobile device with Bluetooth enabled.';
         document.getElementById('scanBluetoothButton').disabled = true;
         document.getElementById('scanBluetoothButton').textContent = 'Bluetooth Not Supported';
       }
+
+      // NFC scanning
+      if ('NDEFReader' in window) {
+        document.getElementById('scanNFCButton').style.display = 'block';
+        document.getElementById('scanNFCButton').addEventListener('click', scanNFC);
+      }
     });
 
-    // Allow manual re-scanning
+    // Allow manual Bluetooth re-scanning
     document.getElementById('scanBluetoothButton').addEventListener('click', scanBluetooth);
 
     // Update device list in UI
@@ -190,7 +268,29 @@
       deviceList.innerHTML = '';
       devices.forEach(device => {
         const li = document.createElement('li');
-        li.textContent = `${device.name} (Detected at ${device.timestamp})`;
+        let details = `${device.name} (${device.type}, Detected at ${device.timestamp})`;
+        if (device.services && device.services.length > 0) {
+          details += '<ul>';
+          device.services.forEach(service => {
+            details += `<li>Service: ${service.uuid}`;
+            if (service.characteristics.length > 0) {
+              details += '<ul>';
+              service.characteristics.forEach(char => {
+                details += `<li>Characteristic: ${char.uuid}, Value: ${char.value}</li>`;
+              });
+              details += '</ul>';
+            }
+            details += '</li>';
+          });
+          details += '</ul>';
+        } else if (device.records && device.records.length > 0) {
+          details += '<ul>';
+          device.records.forEach(record => {
+            details += `<li>Record Type: ${record.recordType}, Data: ${record.data}</li>`;
+          });
+          details += '</ul>';
+        }
+        li.innerHTML = details;
         deviceList.appendChild(li);
       });
     }
@@ -203,69 +303,20 @@
         (position) => {
           const { longitude, latitude } = position.coords;
           const offset = (Math.random() - 0.5) * 0.001;
-          new mapboxgl.Marker({ color: '#007bff' })
+          new mapboxgl.Marker({ color: device.type === 'Bluetooth' ? '#007bff' : '#ff4444' })
             .setLngLat([longitude + offset, latitude + offset])
             .setPopup(new mapboxgl.Popup().setText(device.name))
             .addTo(map);
         },
         () => {
           const offset = (Math.random() - 0.5) * 0.001;
-          new mapboxgl.Marker({ color: '#007bff' })
+          new mapboxgl.Marker({ color: device.type === 'Bluetooth' ? '#007bff' : '#ff4444' })
             .setLngLat([offset, offset])
             .setPopup(new mapboxgl.Popup().setText(device.name))
             .addTo(map);
         }
       );
     }
-
-    // WebSocket for Wi-Fi scanning with retry logic
-    let ws;
-    let wifiErrorDisplayed = false;
-    let wifiRetryCount = 0;
-    function connectWebSocket() {
-      try {
-        ws = new WebSocket('ws://localhost:8080'); // Update to your server if hosted remotely
-        ws.onmessage = (event) => {
-          wifiErrorDisplayed = false;
-          wifiRetryCount = 0;
-          document.getElementById('errorMessage').textContent = '';
-          const wifiData = JSON.parse(event.data);
-          wifiData.forEach(network => {
-            const deviceInfo = {
-              name: network.ssid || 'Unknown Wi-Fi',
-              id: network.mac || `wifi-${Date.now()}`,
-              timestamp: new Date().toLocaleTimeString(),
-            };
-            if (!devices.some(d => d.id === deviceInfo.id)) {
-              devices.push(deviceInfo);
-              updateDeviceList();
-              addDeviceToMap(deviceInfo);
-            }
-          });
-        };
-        ws.onerror = () => {
-          wifiRetryCount++;
-          if (!wifiErrorDisplayed && wifiRetryCount > 3) {
-            wifiErrorDisplayed = true;
-            document.getElementById('errorMessage').textContent = 'Wi-Fi scanning unavailable. Run "node wifi-scan.js" on a device or server.';
-          }
-          setTimeout(connectWebSocket, 5000);
-        };
-        ws.onclose = () => {
-          setTimeout(connectWebSocket, 5000);
-        };
-      } catch (error) {
-        wifiRetryCount++;
-        if (!wifiErrorDisplayed && wifiRetryCount > 3) {
-          wifiErrorDisplayed = true;
-          document.getElementById('errorMessage').textContent = 'Wi-Fi scanning unavailable. Run "node wifi-scan.js" on a device or server.';
-        }
-        setTimeout(connectWebSocket, 5000);
-      }
-    }
-
-    // Start WebSocket connection
-    connectWebSocket();
   </script>
 </body>
 </html>
